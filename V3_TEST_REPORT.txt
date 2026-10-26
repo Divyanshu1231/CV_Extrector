@@ -1,0 +1,10 @@
+FINAL TESTS
+[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m                                                                     [100%][0m
+[32m[32m[1m4 passed[0m[32m in 0.27s[0m[0m
+
+
+REAL UPLOADED CV VERIFICATION
+{'input': 'CURRICULUMVITEdrdal3.pdf', 'cv_code': 'DR. DS 2507', 'filename': 'DR_DS_2507_Space_Consultant.pdf', 'pages': 1, 'watermarks': 1, 'codes': 2, 'remaining_private': [], 'logs': {'name_rects': 5, 'address_rects': 6, 'phone_rects': 2, 'email_rects': 2, 'registration_rects': 0, 'dob_rects': 0, 'pages': 1, 'ocr_pages': 0}}
+{'input': 'lekharesume.pdf', 'cv_code': 'DR. LK 4797', 'filename': 'DR_LK_4797_Space_Consultant.pdf', 'pages': 2, 'watermarks': 2, 'codes': 4, 'remaining_private': [], 'logs': {'name_rects': 2, 'address_rects': 6, 'phone_rects': 1, 'email_rects': 1, 'registration_rects': 0, 'dob_rects': 1, 'pages': 2, 'ocr_pages': 0}}
+
+No stale placeholder source strings: False

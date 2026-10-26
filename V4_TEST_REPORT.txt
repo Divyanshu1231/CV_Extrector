@@ -1,0 +1,29 @@
+CV PRIVACY WATERMARK V4 TEST REPORT
+
+Key change:
+The detected original candidate name is now used as a document-wide privacy key.
+Every occurrence is matched and redacted across all pages, including headers, footers,
+personal-details tables and signatures. Two-column label/value layouts are supported.
+
+Uploaded Swapnil.pdf verification:
+- Original name detected: SWAPNIL NIDVANCHE
+- Original mobile detected: 6303535394
+- CV Code: SN 5394
+- Pages: 3
+- Watermark occurrences: 3
+- CV Code occurrences: 6 (header + footer on each page)
+- Candidate name occurrences remaining: 0
+- Mobile occurrences remaining: 0
+- Email occurrences remaining: 0
+- Location occurrences remaining: 0
+- DOB occurrences remaining: 0
+- Visual inspection: header name/contact area blanked; personal-details name/contact/location/DOB blanked; footer name removed.
+
+Automated backend tests:
+5 passed
+
+Additional prior sample PDFs reprocessed with V4:
+- CURRICULUMVITEdrdal3.pdf -> DR. DS 2507
+- lekharesume.pdf -> DR. LK 4797
+- b5d533d6-4f32-4aef-a325-b225d05d2213.pdf -> DR. DS 7909
+- scanned_dalbir_test.pdf -> DR. DS 2507

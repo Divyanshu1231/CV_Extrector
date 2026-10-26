@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: cv-privacy-watermark-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: "*"

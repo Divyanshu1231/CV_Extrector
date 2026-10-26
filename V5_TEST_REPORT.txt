@@ -1,0 +1,9 @@
+CV PRIVACY WATERMARK V5 TEST REPORT
+
+Scanned CV (Yaduvir_updated_cv.pdf, image-only, 1 page, no "Name:" label):
+- Name detected via OCR header -> CV Code: DR. YS 1268
+- Name removed (header + publication line), phone, email, header city, photo (MediaPipe) removed
+- Metadata empty, encryption removed, post-check: verified = true
+
+Automated tests: see backend/tests (typed Title Case CV, scanned CV, embedded photo, full-page scan not treated as photo,
+metadata stripping, manual fallback, invalid PDF).
