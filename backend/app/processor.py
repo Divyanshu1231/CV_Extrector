@@ -64,7 +64,7 @@ REG_LABEL_RE = re.compile(
     r"^\s*(?:registration(?:\s+number|\s+no\.?)?|reg\.?\s*(?:no|number)?|"
     r"medical\s+(?:council\s+)?registration|state\s+medical\s+council|"
     r"mci\s*/?\s*nmc\s+registration|isa\s*(?:number|no\.?)?|"
-    r"professional\s+registration|license(?:\s+number|\s+no\.?)?)"
+    r"professional\s+registration|license(?:\s+number|\s+no\.?)?)\b"
     r"\s*(?:[:\-–—])?\s*(.*)$", re.I
 )
 
@@ -76,6 +76,39 @@ REG_INLINE_RE = re.compile(
     r"Professional\s+Registration\b|License\s*(?:No|Number)?\b)"
     r"\s*[:\-–—]?\s*[A-Z0-9][A-Z0-9./\- ]{2,35}"
 )
+
+# --- Professional / government IDs: any wording, any line, all pages ------------------
+_ID = r"(?:[A-Z]{1,6}[\s\-/.]*)?\d{3,}(?:[/\-]\d+)*[A-Z]?"
+_REGWORD = r"(?:Regd?|Regn|Registration|Registered|Reg)"
+REG_EXTRA_RES = [
+    # "Regd. No. HN 26086", "Registration No: 12345", "Reg No - MH/2012/1234"
+    re.compile(r"(?i)\b(?:Regd?|Regn|Registration|Reg)\.?\s*(?:No\.?|Number|Num|#)\s*[:\-–—.]?\s*" + _ID),
+    # "Registration: 12345" (colon form)
+    re.compile(r"(?i)\b(?:Regd?|Regn|Registration)\.?\s*[:\-–—]\s*" + _ID),
+    # "Delhi Medical Council Regd. No. HN 26086", "Haryana Medical Council, 12345"
+    re.compile(r"(?i)\b(?:[A-Za-z]+\s+){0,2}(?:Medical|Dental|Nursing|Pharmacy|State)\s+Council(?:\s+of\s+[A-Za-z]+)?"
+               r"[\s,;:|\-–—]*(?:" + _REGWORD + r"\.?\s*(?:No\.?|Number|Num|#)?\s*[:\-–—.]?\s*)?" + _ID),
+    # "NMC UID 12345", "MCI No: 54321", "NMR 12345"
+    re.compile(r"(?i)\b(?:NMC|MCI|NMR|SMC|UID)\s*(?:UID|ID|Reg(?:istration)?\.?|No\.?|Number|#)?\s*[:\-–—#.]?\s*" + _ID),
+    # Government identity numbers
+    re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b"),                                                  # PAN
+    re.compile(r"\b\d{4}\s\d{4}\s\d{4}\b"),                                                 # Aadhaar 4-4-4
+    re.compile(r"(?i)\b(?:Aadhaar|Aadhar|Adhar)\s*(?:No\.?|Number|Card)?\s*[:\-–—#]?\s*\d[\d\s]{9,14}\d"),
+    re.compile(r"(?i)\bPassport\s*(?:No\.?|Number)?\s*[:\-–—#]?\s*[A-Z]\d{7}\b"),
+    re.compile(r"(?i)\b(?:Driving\s+Licen[cs]e|DL)\s*(?:No\.?|Number)?\s*[:\-–—#]?\s*[A-Z0-9][A-Z0-9\-/ ]{7,18}"),
+    re.compile(r"(?i)\b(?:Voter\s*ID|EPIC)\s*(?:No\.?|Number|Card)?\s*[:\-–—#]?\s*[A-Z]{3}\d{7}"),
+    re.compile(r"(?i)\b(?:UAN|PF\s*(?:No|Number)|ESIC?\s*(?:No|Number))\.?\s*[:\-–—#]?\s*\d{8,14}"),
+]
+# label at the end of a line, value on the next line
+REG_LABEL_ONLY_RE = re.compile(r"(?i)\b(?:Regd?|Regn|Registration|Reg)\.?\s*(?:No\.?|Number|Num|#)\s*[:\-–—.]?\s*$")
+REG_VALUE_ONLY_RE = re.compile(r"^\s*" + _ID + r"\s*$", re.I)
+
+# Degrees / credentials written after a name ("Dr. Sudesh Kumar MBBS, MS, MCh").
+DEGREE_TOKENS = {
+    "mbbs", "md", "ms", "mch", "dm", "dnb", "mnams", "frcs", "mrcs", "fics", "facs", "fcps", "mrcp", "frcp",
+    "mrcog", "frcog", "dgo", "dch", "dortho", "dmrd", "ddvl", "bds", "mds", "bams", "bhms", "bpt", "mpt",
+    "phd", "msc", "bsc", "mba", "mph", "mmed", "ficcm", "ficcm", "fnb", "mcps", "dip", "frcr", "mrcpch",
+}
 
 # DOB is personal information even when it is not labeled as "address/contact".
 DOB_RE = re.compile(
@@ -447,7 +480,15 @@ def clean_name_text(text: str) -> str:
     m = RANK_RE.match(t)
     if m and len(t[m.end():].split()) >= 2:                     # keep "Major Singh"
         t = t[m.end():].strip()
-    return t
+    return strip_trailing_degrees(t)
+
+
+def strip_trailing_degrees(t: str) -> str:
+    """"Dr. Sudesh Kumar MBBS MS MCh" -> "Dr. Sudesh Kumar" (credentials are not part of the name)."""
+    words = t.split()
+    while len(words) > 2 and re.sub(r"[^a-z]", "", words[-1].lower()) in DEGREE_TOKENS:
+        words.pop()
+    return " ".join(words)
 
 
 def looks_like_name(text: str) -> bool:
@@ -764,8 +805,9 @@ def redact_rects(page: fitz.Page, rects: list[fitz.Rect], logs: list[str], label
 
 def extend_to_row(page: fitz.Page, rect: fitz.Rect, textpage=None) -> fitz.Rect:
     """Grow a name-line rect to the words immediately left/right of it on the
-    same visual row (rank prefix "COL", suffix "(RETD.)" etc. are separate text
-    spans). Stops at a wide gap so a second column is never swallowed."""
+    same visual row (rank prefix "COL", suffix "(RETD.)" ...). Stops at a wide
+    gap so a second column is never swallowed. Trailing degrees ("MBBS, MS, MCh")
+    are *not* part of the name and stay visible."""
     words = textpage.extractWORDS() if textpage is not None else page.get_text("words")
     h = max(rect.height, 6.0)
     row = [w for w in words
@@ -780,8 +822,12 @@ def extend_to_row(page: fitz.Page, rect: fitz.Rect, textpage=None) -> fitz.Rect:
                 out.x0 = w[0]; changed = True
             elif w[2] > out.x1 and w[0] - out.x1 <= 2.0 * h:
                 out.x1 = w[2]; changed = True
-            out.y0 = min(out.y0, w[1]) if w[0] >= out.x0 - 1 and w[2] <= out.x1 + 1 else out.y0
-            out.y1 = max(out.y1, w[3]) if w[0] >= out.x0 - 1 and w[2] <= out.x1 + 1 else out.y1
+    chain = [w for w in row if w[0] >= out.x0 - 1 and w[2] <= out.x1 + 1]
+    while len(chain) > 2 and re.sub(r"[^a-z]", "", chain[-1][4].lower()) in (DEGREE_TOKENS | {""}):
+        chain.pop()
+    if chain:
+        out = fitz.Rect(min(w[0] for w in chain), min(w[1] for w in chain),
+                        max(w[2] for w in chain), max(w[3] for w in chain))
     return out
 
 
@@ -912,7 +958,7 @@ def redact_sensitive_content(
             rects.append(("social", r))
 
         # 4c) Unlabeled city/state in the header contact block.
-        for r in contact_location_rects(page, lines):
+        for r in (contact_location_rects(page, lines) if pno == 0 else []):
             rects.append(("address", r))
 
         # 5) Medical/professional/state registration: all occurrences/pages.
@@ -921,6 +967,20 @@ def redact_sensitive_content(
                 rects.append(("registration", padded_rect(page, line["rect"], 3, 2)))
         for r in rects_for_regex_lines(page, REG_INLINE_RE, textpage):
             rects.append(("registration", r))
+        # Council / registration / government-ID formats (wording-independent).
+        for pattern in REG_EXTRA_RES:
+            for r in rects_for_regex_lines(page, pattern, textpage):
+                rects.append(("registration", r))
+            if textpage is not None:
+                for r in rects_for_visual_rows_compact(page, pattern, textpage):
+                    rects.append(("registration", r))
+        # "Regd. No." at the end of a line, number on the next line.
+        for idx, line in enumerate(lines[:-1]):
+            nxt = lines[idx + 1]
+            if REG_LABEL_ONLY_RE.search(line["text"]) and REG_VALUE_ONLY_RE.match(nxt["text"]) \
+                    and 0 <= nxt["rect"].y0 - line["rect"].y1 < 30:
+                rects.append(("registration", padded_rect(page, line["rect"], 3, 2)))
+                rects.append(("registration", padded_rect(page, nxt["rect"], 3, 2)))
 
         # 6) DOB: personal data, including two-column personal-detail tables.
         for idx, line in enumerate(lines):
