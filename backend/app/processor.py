@@ -766,22 +766,72 @@ def next_nonempty_lines(lines: list[dict], idx: int, max_lines=6):
         yield j, lines[j]
 
 
+SECTION_HEADING_RE = re.compile(
+    r"^\s*(?:career\s+objective|objective|profile|professional\s+(?:summary|profile|experience|details)|summary|"
+    r"educat\w*|academic\w*|qualification\w*|scholastic|"
+    r"experience|work\s+(?:experience|history)|employment|clinical\s+experience|"
+    r"skills?|key\s+skills|core\s+competenc\w*|areas?\s+of\s+expertise|"
+    r"projects?|publications?|research|certifications?|courses?|training|fellowships?|"
+    r"awards?|honou?rs|achievements?|conferences?|presentations?|"
+    r"references?|languages?|interests?|hobbies|declaration|"
+    r"personal\s+(?:details|information|profile|data)|other\s+details|additional\s+information|"
+    r"membership\w*|licen[cs]es?|internships?|posting\w*|appointments?|designation|present\s+designation)"
+    r"\b", re.I,
+)
+_DEGREE_START_RE = re.compile(
+    r"^\s*(?:m\.?\s?b\.?\s?b\.?\s?s|md|m\.d|ms|m\.s|mch|m\.ch|dm|d\.m|dnb|d\.n\.b|dgo|dch|bds|mds|bams|bhms|b\.?sc|m\.?sc|"
+    r"b\.?tech|m\.?tech|mba|bba|phd|ph\.d|idccm|idcc|fccs|ficcm|diploma|fellowship|mrcp|mrcs|frcs|mnams)\b", re.I,
+)
+_INSTITUTION_WORD_RE = re.compile(
+    r"(?i)\b(?:hospital|college|university|institute|institution|clinic|school|academy|centre|center|"
+    r"company|ltd|pvt|limited|consultant|intensivist|surgeon|resident|professor|lecturer|physician|doctor|"
+    r"department|dept|fellowship|qualification\w*|experience|years?|yrs?)\b"
+)
+
+
 def is_section_or_new_field(text: str) -> bool:
-    t = text.strip().lower()
+    t = text.strip()
     if not t:
         return True
     field_patterns = [
         NAME_LABEL_RE, PHONE_LABEL_RE, EMAIL_LABEL_RE,
-        ADDRESS_LABEL_RE, REG_LABEL_RE,
+        ADDRESS_LABEL_RE, REG_LABEL_RE, DOB_LABEL_RE,
     ]
-    if any(p.match(text) for p in field_patterns):
+    if any(p.match(t) for p in field_patterns):
         return True
-    return bool(re.match(
-        r"^(career objective|objective|profile|summary|education|academic qualification|"
-        r"experience|employment|skills|projects|publications|certifications|"
-        r"professional experience|work experience|references|languages|interests|"
-        r"achievements|conferences)\b", t, re.I
-    ))
+    if SECTION_HEADING_RE.match(t):
+        return True
+    words = t.split()
+    # Short "Something Like This:" lines and ALL-CAPS headings are section headings.
+    if len(words) <= 6 and t.rstrip().endswith(":"):
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", t)
+    if letters and letters.isupper() and len(words) <= 5 and len(letters) >= 4:
+        return True
+    return False
+
+
+def looks_like_address_continuation(text: str, prev_text: str = "") -> bool:
+    """Is `text` plausibly the next line of a multi-line postal address?
+    Qualification, experience and other CV content must never be swallowed."""
+    t = text.strip()
+    if is_section_or_new_field(t) or _DEGREE_START_RE.match(t) or _INSTITUTION_WORD_RE.search(t):
+        return False
+    if any(re.sub(r"[^a-z]", "", w.lower()) in DEGREE_TOKENS for w in t.split()):
+        return False
+    low = t.lower()
+    if re.search(r"\d", t):                                              # plot / pincode / phone-like digits
+        return True
+    if re.search(r"\b(?:road|rd|street|st|lane|nagar|colony|sector|block|phase|apartments?|apt|society|"
+                 r"vihar|enclave|marg|chowk|bazaar|market|park|extension|ext|village|district|dist|tehsil|"
+                 r"post|near|opp|opposite|behind|house|flat|plot|floor|tower|residency|heights|city)\b", low):
+        return True
+    toks = [re.sub(r"[^a-z]", "", w.lower()) for w in t.split()]
+    if any(tok in PLACE_WORDS for tok in toks if tok):
+        return True
+    if prev_text.rstrip().endswith(",") and len(t.split()) <= 6:           # address line wrapped after a comma
+        return True
+    return False
 
 
 def redact_rects(page: fitz.Page, rects: list[fitz.Rect], logs: list[str], label: str):
@@ -890,17 +940,18 @@ def redact_sensitive_content(
             if not ADDRESS_LABEL_RE.match(line["text"]):
                 continue
             rects.append(("address", padded_rect(page, line["rect"], 3, 2)))
-            # Capture the value on same line and continuation lines.
+            # Capture the value on same line and genuine address continuation lines only.
             base_y = line["rect"].y1
-            for j, nxt in next_nonempty_lines(lines, idx, max_lines=6):
+            prev_text = line["text"]
+            for j, nxt in next_nonempty_lines(lines, idx, max_lines=4):
                 gap = nxt["rect"].y0 - base_y
                 if gap > 34:
                     break
-                if is_section_or_new_field(nxt["text"]):
+                if not looks_like_address_continuation(nxt["text"], prev_text):
                     break
-                # Address continuation is allowed to span several lines.
                 rects.append(("address", padded_rect(page, nxt["rect"], 3, 2)))
                 base_y = nxt["rect"].y1
+                prev_text = nxt["text"]
 
         # 2a) Place/location lines at the end of CVs are also personal location data.
         for line in lines:
@@ -989,7 +1040,10 @@ def redact_sensitive_content(
                 same = _same_row_value(lines, line["rect"])
                 if same:
                     rects.append(("dob", padded_rect(page, same[1], 3, 2)))
-                elif idx + 1 < len(lines) and 0 <= lines[idx+1]["rect"].y0 - line["rect"].y1 < 30:
+                elif idx + 1 < len(lines) and 0 <= lines[idx+1]["rect"].y0 - line["rect"].y1 < 30 \
+                        and not is_section_or_new_field(lines[idx+1]["text"]) \
+                        and not _DEGREE_START_RE.match(lines[idx+1]["text"]) \
+                        and re.search(r"\d", lines[idx+1]["text"]):
                     rects.append(("dob", padded_rect(page, lines[idx+1]["rect"], 3, 2)))
         for r in rects_for_regex_lines(page, DOB_RE, textpage):
             rects.append(("dob", r))
