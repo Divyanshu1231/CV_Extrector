@@ -57,7 +57,7 @@ ADDRESS_HEURISTIC_RE = re.compile(
     r"(?i)(?:\b(?:house\s*(?:no|number)?|h\.\s*no\.?|flat\s*(?:no|number)?|"
     r"plot\s*(?:no|number)?|near|district|distt?\.?|pin(?:\s*code)?|pincode|"
     r"post\s+office|village|tehsil)\b[^,;\n]{0,80}|"
-    r"\b[A-Za-z0-9.-]+\s+(?:road|street|lane|nagar|colony|sector)\b[^,;\n]{0,60})"
+    r"\b(?-i:[A-Z0-9])[A-Za-z0-9.-]*\s+(?:road|street|lane|nagar|colony|sector)\b(?![-\w])[^,;\n]{0,60})"
 )
 
 REG_LABEL_RE = re.compile(
@@ -497,6 +497,12 @@ def looks_like_name(text: str) -> bool:
         return False
     if BAD_NAME_RE.search(t):
         return False
+    first = t.split()[0]
+    if re.sub(r"[^a-z]", "", first.lower()) in DEGREE_TOKENS and not first.endswith("."):
+        return False                      # "MS Orthopaedics", "MD Medicine": a degree, not "Ms." the title
+    toks = [re.sub(r"[^a-z]", "", w.lower()) for w in t.split()]
+    if toks and all(tok in PLACE_WORDS for tok in toks if tok):
+        return False                      # "Gwalior, Madhya Pradesh"
     title, body = parse_title_and_name(t)
     words = clean_words(body)
     n = len(words)
@@ -509,6 +515,21 @@ def looks_like_name(text: str) -> bool:
             return False
     alpha = re.sub(r"[^A-Za-z]", "", body)
     return len(alpha) >= 5 and any(len(re.sub(r"[^A-Za-z]", "", w)) >= 3 for w in words)
+
+
+SINGLE_NAME_STOP = {"cv", "resume", "curriculum", "vitae", "biodata", "profile", "summary", "contact", "about", "page"}
+
+
+def looks_like_single_name(text: str) -> bool:
+    """One-word names such as the large "MAYANK" at the top of a modern CV.
+    Only a *candidate*: _rank_candidates additionally demands prominence."""
+    t = clean_name_text(text)
+    if not re.fullmatch(r"[A-Za-z][A-Za-z'’-]{2,24}", t):
+        return False
+    low = t.lower()
+    if low in SINGLE_NAME_STOP or low in PLACE_WORDS or low in DEGREE_TOKENS or BAD_NAME_RE.search(t):
+        return False
+    return t[0].isupper()
 
 
 def _is_name_candidate(text: str) -> bool:  # backwards compatible alias
@@ -551,8 +572,18 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
                 if looks_like_name(text):
                     cands.append({"text": text, "page": pno, "rect": line["rect"],
                                   "size": line["rect"].height, "bold": False})
+                elif looks_like_single_name(text) and line["rect"].y0 <= H * 0.22:
+                    all_h = sorted(l["rect"].height for l in line_items(page, tp)) or [0]
+                    others = [l["rect"].height for l in line_items(page, tp)
+                              if l["rect"].y0 <= H * 0.35 and l is not line]
+                    cands.append({"text": text, "page": pno, "rect": line["rect"], "size": line["rect"].height,
+                                  "bold": False, "single": True, "median": all_h[len(all_h) // 2],
+                                  "others_max": max(others, default=0)})
             continue
         data = page.get_text("dict")
+        all_sizes = sorted(float(sp.get("size", 0)) for b in data.get("blocks", []) if b.get("type") == 0
+                           for ln in b.get("lines", []) for sp in ln.get("spans", []) if sp.get("text", "").strip()) or [0]
+        median_size = all_sizes[len(all_sizes) // 2]
         entries = []
         for block in data.get("blocks", []):
             if block.get("type") != 0:
@@ -586,10 +617,15 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
             for e in row[1:]:
                 rect |= e["rect"]
             text = clean_name_text(" ".join(e["text"] for e in row))
+            size = max(e["size"] for e in row)
             if looks_like_name(text):
-                cands.append({"text": text, "page": pno, "rect": rect,
-                              "size": max(e["size"] for e in row),
+                cands.append({"text": text, "page": pno, "rect": rect, "size": size,
                               "bold": any(e["bold"] for e in row)})
+            elif looks_like_single_name(text) and rect.y0 <= H * 0.22:
+                others = [max(x["size"] for x in r2) for r2 in rows if r2 is not row]
+                cands.append({"text": text, "page": pno, "rect": rect, "size": size,
+                              "bold": any(e["bold"] for e in row), "single": True,
+                              "median": median_size, "others_max": max(others, default=0)})
     return cands
 
 
@@ -599,6 +635,13 @@ def _rank_candidates(cands, doc, filename: str):
     ranked = []
     for c in cands:
         page_h = doc[c["page"]].rect.height
+        if c.get("single"):
+            tok = re.sub(r"[^a-z]", "", c["text"].lower())
+            prominent = c["size"] >= 1.35 * max(c.get("median", 0), 1)
+            unique_largest = c["size"] >= 1.25 * max(c.get("others_max", 0), 1)
+            confirmed = tok in file_hints or (len(tok) >= 4 and any(tok in e for e in emails))
+            if not (prominent and (confirmed or unique_largest)):
+                continue
         score = c["size"] * 10 + (12 if c["bold"] else 0)
         score += max(0.0, 30.0 * (1 - c["rect"].y0 / (page_h * 0.35)))
         toks = [re.sub(r"[^a-z]", "", t.lower()) for t in c["text"].split()]
@@ -834,6 +877,27 @@ def looks_like_address_continuation(text: str, prev_text: str = "") -> bool:
     return False
 
 
+def _clip_to_neighbors(r: fitz.Rect, words: list) -> fitz.Rect:
+    """PDF redaction deletes every glyph whose box touches the rectangle, so a rect
+    that overlaps the line above/below by a point would also delete that line.
+    Pull the rect back from words that sit on a *different* row."""
+    r = fitz.Rect(r)
+    h = max(r.height, 1.0)
+    for w in words:
+        wr = fitz.Rect(w[:4])
+        if not wr.intersects(r):
+            continue
+        cy = (wr.y0 + wr.y1) / 2
+        if r.y0 <= cy <= r.y1 and wr.height >= 0.45 * h:
+            continue                                    # same row, same text size: meant to be covered
+        mid = (r.y0 + r.y1) / 2
+        if cy > mid:                                    # neighbour below
+            r.y1 = min(r.y1, max(r.y0 + 0.55 * h, wr.y0))
+        else:                                           # neighbour above
+            r.y0 = max(r.y0, min(wr.y1, r.y1 - 0.55 * h))
+    return r
+
+
 def redact_rects(page: fitz.Page, rects: list[fitz.Rect], logs: list[str], label: str):
     # Deduplicate overlapping rectangles, then apply real PDF redactions.
     unique = []
@@ -847,6 +911,9 @@ def redact_rects(page: fitz.Page, rects: list[fitz.Rect], logs: list[str], label
             return inter.get_area() / max(1.0, min(a.get_area(), b.get_area()))
         if not any(overlap_ratio(r, u) > 0.95 for u in unique):
             unique.append(r)
+    words = page.get_text("words")
+    if words:
+        unique = [_clip_to_neighbors(r, words) for r in unique]
     for r in unique:
         page.add_redact_annot(r, fill=(1, 1, 1), cross_out=False)
         logs.append(str(tuple(round(v, 2) for v in r)))
@@ -860,8 +927,12 @@ def extend_to_row(page: fitz.Page, rect: fitz.Rect, textpage=None) -> fitz.Rect:
     are *not* part of the name and stay visible."""
     words = textpage.extractWORDS() if textpage is not None else page.get_text("words")
     h = max(rect.height, 6.0)
+    # Same visual row = word centre inside the name line AND comparable text height,
+    # so a smaller subtitle line right under a big name ("SENIOR RESIDENT") is never swallowed.
     row = [w for w in words
-           if min(w[3], rect.y1) - max(w[1], rect.y0) >= 0.5 * min(w[3] - w[1], rect.height)]
+           if rect.y0 - 1 <= (w[1] + w[3]) / 2 <= rect.y1 + 1
+           and (w[3] - w[1]) >= 0.45 * min(rect.height, max(w[3] - w[1], 1) * 3)
+           and (w[3] - w[1]) >= 0.45 * rect.height]
     row.sort(key=lambda w: w[0])
     out = fitz.Rect(rect)
     changed = True
@@ -931,7 +1002,7 @@ def redact_sensitive_content(
         # 1b) The detected name line itself (e.g. "COL (DR.) NAME (RETD.)"): rank,
         # brackets and suffixes around the name must disappear with it.
         if name_line_rect is not None and name_page == pno:
-            rects.append(("name", padded_rect(page, extend_to_row(page, fitz.Rect(name_line_rect), textpage), 3, 2)))
+            rects.append(("name", padded_rect(page, extend_to_row(page, fitz.Rect(name_line_rect), textpage), 3, 0.5)))
 
         # 2) Addresses: detect EVERY labeled address block, including
         # "Address No 1", "Address No 2", etc. Continue until another field
@@ -952,6 +1023,20 @@ def redact_sensitive_content(
                 rects.append(("address", padded_rect(page, nxt["rect"], 3, 2)))
                 base_y = nxt["rect"].y1
                 prev_text = nxt["text"]
+
+        # 2a-0) Signature block: "Declaration ... / <Name> / <City, State>" -> remove the place line.
+        for idx, line in enumerate(lines):
+            if not re.match(r"(?i)^\s*(?:declaration|i\s+hereby\s+declare)", line["text"]):
+                continue
+            base_y = line["rect"].y1
+            for nxt in lines[idx + 1: idx + 7]:
+                if nxt["rect"].y0 - base_y > 70:
+                    break
+                toks = [re.sub(r"[^a-z]", "", w[4].lower()) for w in nxt["words"]]
+                toks = [t for t in toks if t]
+                if toks and len(toks) <= 5 and all(t in PLACE_WORDS for t in toks):
+                    rects.append(("address", padded_rect(page, nxt["rect"], 3, 2)))
+                base_y = max(base_y, nxt["rect"].y1)
 
         # 2a) Place/location lines at the end of CVs are also personal location data.
         for line in lines:
