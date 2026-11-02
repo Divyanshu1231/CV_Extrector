@@ -15,7 +15,22 @@ from . import photo
 logger = logging.getLogger("cv-privacy")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-WATERMARK = "Space Consultant Ph.9891417909"
+# Selectable agency watermarks (key -> text printed diagonally on every page).
+WATERMARKS = {
+    "space_consultant": {"label": "Space Consultant – 9891417909",
+                         "text": "Space Consultant Ph.9891417909", "suffix": "Space_Consultant"},
+    "first_employer": {"label": "FirstEmployer – 8882968815",
+                       "text": "FirstEmployer Ph.8882968815", "suffix": "FirstEmployer"},
+}
+DEFAULT_WATERMARK = "space_consultant"
+WATERMARK = WATERMARKS[DEFAULT_WATERMARK]["text"]      # kept for backwards compatibility
+
+
+def resolve_watermark(key: str | None) -> dict:
+    key = (key or DEFAULT_WATERMARK).strip().lower()
+    if key not in WATERMARKS:
+        raise DetectionError("BAD_WATERMARK", "Please choose a valid watermark from the list.")
+    return {"key": key, **WATERMARKS[key]}
 
 TITLE_RE = re.compile(r"^(DR|MR|MRS|MS|PROF)\.?\s*$", re.I)
 
@@ -459,6 +474,7 @@ NAME_STOP_FILE_WORDS = {
     "cv", "resume", "updated", "update", "final", "new", "latest", "copy", "doc", "docx", "pdf", "profile",
     "curriculum", "vitae", "scan", "scanned", "file", "version", "dr", "mr", "mrs", "ms", "prof", "my", "the",
     "of", "and", "for", "medical", "doctor", "cvs", "resumes", "image", "img", "whatsapp", "download",
+    "naukri", "monster", "shine", "indeed", "linkedin", "timesjobs", "apna", "foundit",
     "col", "colonel", "maj", "major", "gen", "capt", "captain", "brig", "retd", "ret", "retired", "lt", "cdr", "surg",
 }
 
@@ -477,6 +493,9 @@ def clean_name_text(text: str) -> str:
     t = RETIRED_RE.sub(" ", t)                                  # "(RETD.)" -> ""
     t = re.sub(r"[|_•·\\/\[\]{}()<>@#*~^`=+:;,\"“”]", " ", t)
     t = re.sub(r"\s+", " ", t).strip(" -–—.")
+    # "DR. R. LAKSHMI SINDHUJA-CV", "Resume of Amit Sharma", "CV - Amit Sharma"
+    t = re.sub(r"(?i)^(?:cv|resume|curriculum\s+vitae|biodata)\s*(?:of|[:\-–—])\s*", "", t)
+    t = re.sub(r"(?i)[\s\-–—_:]*\b(?:cv|resume|curriculum\s+vitae|biodata)\b\s*$", "", t).strip(" -–—.")
     m = RANK_RE.match(t)
     if m and len(t[m.end():].split()) >= 2:                     # keep "Major Singh"
         t = t[m.end():].strip()
@@ -566,7 +585,7 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
         tp = get_ocr_textpage(page)
         if tp is not None:
             for line in line_items(page, tp):
-                if line["rect"].y0 > H * 0.35:
+                if line["rect"].y0 > H * (0.35 if pno == 0 else 0.12):
                     continue
                 text = clean_name_text(line["text"])
                 if looks_like_name(text):
@@ -592,7 +611,7 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
                 spans = line.get("spans", [])
                 text = " ".join(sp.get("text", "") for sp in spans).strip()
                 bbox = fitz.Rect(line.get("bbox", (0, 0, 0, 0)))
-                if not text or bbox.y0 > H * 0.35:
+                if not text or bbox.y0 > H * (0.35 if pno == 0 else 0.12):
                     continue
                 size = max((float(sp.get("size", 0)) for sp in spans), default=0)
                 bold = any("bold" in str(sp.get("font", "")).lower() or (sp.get("flags", 0) & 16) for sp in spans)
@@ -1210,7 +1229,7 @@ def _band_is_busy(page: fitz.Page, rect: fitz.Rect) -> bool:
         return False
 
 
-def add_watermark_and_code(doc: fitz.Document, cv_code: str):
+def add_watermark_and_code(doc: fitz.Document, cv_code: str, watermark_text: str = WATERMARK):
     for page in doc:
         # Everything scales with page size so scanned/A3/phone-size pages look
         # exactly as professional as a normal A4 CV.
@@ -1231,7 +1250,7 @@ def add_watermark_and_code(doc: fitz.Document, cv_code: str):
         point = fitz.Point(page.rect.width / 2 - 150 * k, page.rect.height / 2 + 110 * k)
         rot = fitz.Matrix(1, 1).prerotate(40)
         page.insert_text(
-            point, WATERMARK, fontsize=26 * k, fontname="helv",
+            point, watermark_text, fontsize=26 * k, fontname="helv",
             color=(0.65, 0.65, 0.65), fill_opacity=0.32,
             stroke_opacity=0, morph=(fitz.Point(page.rect.width / 2, page.rect.height / 2), rot), overlay=True
         )
@@ -1274,9 +1293,9 @@ def sanitize_document(doc: fitz.Document):
             pass
 
 
-def safe_filename(cv_code: str) -> str:
+def safe_filename(cv_code: str, suffix: str = "Space_Consultant") -> str:
     safe = re.sub(r"[^A-Za-z0-9]+", "_", cv_code).strip("_")
-    return f"{safe}_Space_Consultant.pdf"
+    return f"{safe}_{suffix}.pdf"
 
 
 def _page_text(page: fitz.Page) -> str:
@@ -1323,7 +1342,9 @@ def process_pdf(
     original_filename: str = "input.pdf",
     name_override: str = "",
     phone_override: str = "",
+    watermark: str = DEFAULT_WATERMARK,
 ) -> ProcessResult:
+    wm = resolve_watermark(watermark)
     if not data[:1024].lstrip().startswith(b"%PDF"):
         raise DetectionError("NOT_A_PDF", "The uploaded file is not a valid PDF.")
     try:
@@ -1372,7 +1393,7 @@ def process_pdf(
         logs = redact_sensitive_content(doc, original_name, name_page, original_phone, name_rect)
         redact_candidate_photos(doc, logs)
         sanitize_document(doc)
-        add_watermark_and_code(doc, cv_code)
+        add_watermark_and_code(doc, cv_code, wm["text"])
         pdf_bytes = _save(doc)
         doc.close()
 
@@ -1400,11 +1421,12 @@ def process_pdf(
             "links_removed": len(logs["social_rects"]),
             "photos_removed": len(logs["photo_rects"]),
             "photo_detector": logs.get("photo_detector", "none"),
+            "watermark": wm["key"],
             "verified": not issues,
             "issues": issues,
             "passes": passes,
         }
-        return ProcessResult(pdf_bytes, cv_code, safe_filename(cv_code), logs, report)
+        return ProcessResult(pdf_bytes, cv_code, safe_filename(cv_code, wm["suffix"]), logs, report)
     finally:
         try:
             if not doc.is_closed:
