@@ -61,9 +61,10 @@ EMAIL_LABEL_RE = re.compile(
     r"^\s*(?:e[-\s]?mail|email\s+id|email\s+i['’]?d)\s*(?:[:\-–—])?\s*(.*)$", re.I
 )
 ADDRESS_LABEL_RE = re.compile(
-    r"^\s*(?:address(?:\s*\.?\s*(?:no|number)\s*\d*)?|"
-    r"permanent\s+address|current\s+address|residential\s+address|"
-    r"residence|residential\s+location|home\s+address)\s*(?:[:\-–—])?\s*(.*)$", re.I
+    r"^\s*(?:address(?:\s*\.?\s*(?:no|number)\s*\d*)?|address\s+for\s+(?:correspondence|communication)|"
+    r"(?:permanent|current|present|residential|resident|contact|correspondence|postal|mailing|communication|"
+    r"local|home|house|personal)\s+address(?:\s*\.?\s*(?:no|number)\s*\d*)?|"
+    r"residence|residential\s+location)\s*(?:[:\-–—])?\s*(.*)$", re.I
 )
 DOB_LABEL_RE = re.compile(
     r"^\s*(?:date\s+of\s+birth|dob)\s*(?:[:\-–—])?\s*(.*)$", re.I
@@ -117,6 +118,8 @@ REG_EXTRA_RES = [
 # label at the end of a line, value on the next line
 REG_LABEL_ONLY_RE = re.compile(r"(?i)\b(?:Regd?|Regn|Registration|Reg)\.?\s*(?:No\.?|Number|Num|#)\s*[:\-–—.]?\s*$")
 REG_VALUE_ONLY_RE = re.compile(r"^\s*" + _ID + r"\s*$", re.I)
+
+NAME_TAIL_NOISE = {"curriculum", "vitae", "page", "cv", "resume", "of", "biodata"}
 
 # Degrees / credentials written after a name ("Dr. Sudesh Kumar MBBS, MS, MCh").
 DEGREE_TOKENS = {
@@ -308,6 +311,71 @@ def get_ocr_textpage(page: fitz.Page):
     return tp
 
 
+def _is_letterspaced(words: list) -> bool:
+    """Headings like "D r . M a s o o d" (expanded character spacing) arrive from the
+    PDF as one word per letter."""
+    return len(words) >= 8 and sum(1 for w in words if len(w[4]) == 1) >= 0.7 * len(words)
+
+
+def merge_letterspaced(words: list) -> list:
+    """Re-join single-letter words of one visual line into real words using the
+    horizontal gaps (letter gap ~ constant, word gap clearly larger)."""
+    ws = sorted(words, key=lambda w: (w[0], w[1]))
+    if not _is_letterspaced(ws):
+        return ws
+    gaps = sorted(ws[i + 1][0] - ws[i][2] for i in range(len(ws) - 1))
+    med = gaps[len(gaps) // 2]
+    thr = max(1.7 * max(med, 0.5), med + 2.0)
+    groups, cur = [], [ws[0]]
+    for prev, w in zip(ws, ws[1:]):
+        if w[0] - prev[2] > thr:
+            groups.append(cur)
+            cur = [w]
+        else:
+            cur.append(w)
+    groups.append(cur)
+    return [
+        (min(w[0] for w in g), min(w[1] for w in g), max(w[2] for w in g), max(w[3] for w in g),
+         "".join(w[4] for w in g), g[0][5], g[0][6], g[0][7])
+        for g in groups
+    ]
+
+
+def regroup_letterspaced(words: list) -> list:
+    """Find visual rows made of single-letter words (expanded character spacing,
+    whatever block/line ids the PDF generator gave them) and re-join them into real
+    words that all share one (block, line) id, so the row behaves like normal text."""
+    if sum(1 for w in words if len(w[4]) == 1) < 8:
+        return words
+    order = sorted(words, key=lambda w: ((w[1] + w[3]) / 2, w[0]))
+    rows: list[list] = []
+    for w in order:
+        cy, h = (w[1] + w[3]) / 2, max(w[3] - w[1], 1.0)
+        if rows:
+            last = rows[-1]
+            lcy = sum((x[1] + x[3]) / 2 for x in last) / len(last)
+            if abs(cy - lcy) <= 0.5 * min(h, max(last[0][3] - last[0][1], 1.0)):
+                last.append(w)
+                continue
+        rows.append([w])
+    out = []
+    for row in rows:
+        row.sort(key=lambda w: w[0])
+        if _is_letterspaced(row):
+            merged = merge_letterspaced(row)
+            blk, ln = row[0][5], row[0][6]
+            out.extend((m[0], m[1], m[2], m[3], m[4], blk, ln, m[7]) for m in merged)
+        else:
+            out.extend(row)
+    return out
+
+
+def page_words(page: fitz.Page, textpage=None) -> list:
+    """All words of the page (text layer or OCR), letter-spaced headings merged."""
+    src = textpage.extractWORDS() if textpage is not None else page.get_text("words")
+    return regroup_letterspaced(src)
+
+
 def line_items(page: fitz.Page, textpage=None) -> list[dict]:
     """
     Return logical PDF text lines built from PyMuPDF word coordinates.
@@ -315,7 +383,7 @@ def line_items(page: fitz.Page, textpage=None) -> list[dict]:
     labels in one column and values in another.
     """
     groups = {}
-    words_source = textpage.extractWORDS() if textpage is not None else page.get_text("words")
+    words_source = regroup_letterspaced(textpage.extractWORDS() if textpage is not None else page.get_text("words"))
     for w in words_source:
         x0, y0, x1, y1, text, block, line, word = w
         key = (block, line)
@@ -323,7 +391,7 @@ def line_items(page: fitz.Page, textpage=None) -> list[dict]:
 
     result = []
     for _, words in groups.items():
-        words.sort(key=lambda x: (x[0], x[1]))
+        words = sorted(words, key=lambda x: (x[0], x[1]))
         text = " ".join(w[4] for w in words).strip()
         if not text:
             continue
@@ -489,7 +557,9 @@ BRACKET_TITLE_RE = re.compile(r"\(\s*(dr|prof|mr|mrs|ms)\s*\.?\s*\)", re.I)
 
 
 def clean_name_text(text: str) -> str:
-    t = BRACKET_TITLE_RE.sub(lambda m: m.group(1) + ".", text)  # "(DR.)" -> "DR."
+    t = re.sub(r"(?i)\bcurriculum\s+vitae\b", " ", text)                    # running header "Name  Curriculum Vitae  Page | 1"
+    t = re.sub(r"(?i)\bpage\s*(?:[|:\-]\s*)?\d+(?:\s*(?:of|/)\s*\d+)?", " ", t)
+    t = BRACKET_TITLE_RE.sub(lambda m: m.group(1) + ".", t)  # "(DR.)" -> "DR."
     t = RETIRED_RE.sub(" ", t)                                  # "(RETD.)" -> ""
     t = re.sub(r"[|_•·\\/\[\]{}()<>@#*~^`=+:;,\"“”]", " ", t)
     t = re.sub(r"\s+", " ", t).strip(" -–—.")
@@ -599,6 +669,13 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
                                   "bold": False, "single": True, "median": all_h[len(all_h) // 2],
                                   "others_max": max(others, default=0)})
             continue
+        merged_lines = line_items(page)
+        raw_words = page.get_text("words")
+        ls_rows = []                       # rows that were letter-spaced in the PDF ("D r . M a s o o d")
+        for ml in merged_lines:
+            raw_n = sum(1 for w in raw_words if ml["rect"].contains(fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2)))
+            if raw_n >= 8 and raw_n >= 2 * len(ml["words"]):
+                ls_rows.append(ml)
         data = page.get_text("dict")
         all_sizes = sorted(float(sp.get("size", 0)) for b in data.get("blocks", []) if b.get("type") == 0
                            for ln in b.get("lines", []) for sp in ln.get("spans", []) if sp.get("text", "").strip()) or [0]
@@ -613,9 +690,16 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
                 bbox = fitz.Rect(line.get("bbox", (0, 0, 0, 0)))
                 if not text or bbox.y0 > H * (0.35 if pno == 0 else 0.12):
                     continue
+                centre = fitz.Point((bbox.x0 + bbox.x1) / 2, (bbox.y0 + bbox.y1) / 2)
+                if any(r_["rect"].contains(centre) for r_ in ls_rows):
+                    continue                       # re-added below from the re-joined words
                 size = max((float(sp.get("size", 0)) for sp in spans), default=0)
                 bold = any("bold" in str(sp.get("font", "")).lower() or (sp.get("flags", 0) & 16) for sp in spans)
                 entries.append({"text": text, "rect": bbox, "size": size, "bold": bool(bold)})
+        for r_ in ls_rows:
+            if r_["rect"].y0 <= H * (0.35 if pno == 0 else 0.12):
+                entries.append({"text": re.sub(r"(?<=[a-z])(?=[A-Z])", " ", r_["text"]),   # "MasoodAhmed" -> "Masood Ahmed"
+                                "rect": fitz.Rect(r_["rect"]), "size": r_["rect"].height / 1.1, "bold": False})
         # Text pieces on the same visual row (rank / title / name / suffix often sit in
         # separate text blocks) are merged left-to-right before judging them.
         entries.sort(key=lambda e: (round(e["rect"].y0), e["rect"].x0))
@@ -720,24 +804,46 @@ def find_labeled_value(lines: list[dict], label_re: re.Pattern):
     return None
 
 
-def name_rects_in_line(page: fitz.Page, line: dict, candidate_name: str, fuzzy: bool = False) -> list[fitz.Rect]:
+def _name_targets(candidate_name: str) -> list[tuple[str, int]]:
+    """(compact_target, max_words) for every way the name can appear:
+    "Dr. Masood Ahmed Tahashildar", "Masood Tahashildar", "Tahashildar M", "Tahashildar MA",
+    "M. A. Tahashildar" (publication author lists)."""
     title, body = parse_title_and_name(candidate_name)
-    variants = []
+    out: list[tuple[str, int]] = []
+
+    def add(tokens: list[str], extra: int = 0):
+        compact = "".join(tokens)
+        if compact and all(compact != c for c, _ in out):
+            out.append((compact, len(tokens) + 1 + extra))
+
     for nm in (candidate_name, body):
         toks = re.sub(r"[^a-z0-9]+", " ", nm.lower()).strip().split()
-        if toks and toks not in variants:
-            variants.append(toks)
+        if toks:
+            add(toks)
+    toks = re.sub(r"[^a-z0-9]+", " ", body.lower()).strip().split()
+    if len(toks) >= 2:
+        first, last = toks[0], toks[-1]
+        given = toks[:-1]
+        inits_all = "".join(t[0] for t in given)
+        for compact, words in (
+            (first + last, 2), (last + first, 2),
+            (last + inits_all, 1 + len(inits_all)), (last + first[0], 2),
+            (inits_all + last, 1 + len(inits_all)), (first[0] + last, 2),
+        ):
+            if len(compact) >= 7 and all(compact != c for c, _ in out):   # short surnames are too ambiguous
+                out.append((compact, words + 1))
+    return out
+
+
+def name_rects_in_line(page: fitz.Page, line: dict, candidate_name: str, fuzzy: bool = False) -> list[fitz.Rect]:
     words = line["words"]
     normalized = [re.sub(r"[^a-z0-9]+", "", w[4].lower()) for w in words]
     out = []
-    for target_tokens in variants:
-        target_compact = "".join(target_tokens)
-        if not target_compact:
-            continue
+    for target_compact, max_words in _name_targets(candidate_name):
         for i in range(len(words)):
             compact = ""
             selected = []
-            for j in range(i, min(len(words), i + len(target_tokens) + 2)):
+            for j in range(i, min(len(words), i + max_words + 1)):
                 if not normalized[j]:
                     continue
                 compact += normalized[j]
@@ -944,7 +1050,7 @@ def extend_to_row(page: fitz.Page, rect: fitz.Rect, textpage=None) -> fitz.Rect:
     same visual row (rank prefix "COL", suffix "(RETD.)" ...). Stops at a wide
     gap so a second column is never swallowed. Trailing degrees ("MBBS, MS, MCh")
     are *not* part of the name and stay visible."""
-    words = textpage.extractWORDS() if textpage is not None else page.get_text("words")
+    words = page_words(page, textpage)
     h = max(rect.height, 6.0)
     # Same visual row = word centre inside the name line AND comparable text height,
     # so a smaller subtitle line right under a big name ("SENIOR RESIDENT") is never swallowed.
@@ -963,8 +1069,9 @@ def extend_to_row(page: fitz.Page, rect: fitz.Rect, textpage=None) -> fitz.Rect:
             elif w[2] > out.x1 and w[0] - out.x1 <= 2.0 * h:
                 out.x1 = w[2]; changed = True
     chain = [w for w in row if w[0] >= out.x0 - 1 and w[2] <= out.x1 + 1]
-    while len(chain) > 2 and re.sub(r"[^a-z]", "", chain[-1][4].lower()) in (DEGREE_TOKENS | {""}):
-        chain.pop()
+    while len(chain) > 2 and (re.sub(r"[^a-z]", "", chain[-1][4].lower()) in (DEGREE_TOKENS | NAME_TAIL_NOISE | {""})
+                              or chain[-1][4].strip("|").isdigit()):
+        chain.pop()                      # degrees and "Curriculum Vitae  Page | 1" stay visible
     if chain:
         out = fitz.Rect(min(w[0] for w in chain), min(w[1] for w in chain),
                         max(w[2] for w in chain), max(w[3] for w in chain))
@@ -993,6 +1100,7 @@ def redact_sensitive_content(
         name_variants.add(body_name)
         name_variants.add(f"{title} {body_name}")
     phone_digits = normalize_phone(original_phone)
+    refs_started = False                    # once "References" has begun, everything after it belongs to other people
 
     for pno, page in enumerate(doc):
         textpage = get_ocr_textpage(page)
@@ -1000,6 +1108,11 @@ def redact_sensitive_content(
             logs["ocr_pages"].append(pno + 1)
         lines = line_items(page, textpage)
         rects = []
+        ref_y = 0.0 if refs_started else float("inf")
+        for ln_ in lines:
+            if re.match(r"(?i)^\s*(?:references?|referees?)\b", ln_["text"]):
+                ref_y = min(ref_y, ln_["rect"].y0)
+                refs_started = True
 
         # 1) Candidate name is a document-wide privacy key. Remove every
         # occurrence, including headers, footers, signatures and personal tables.
@@ -1069,6 +1182,8 @@ def redact_sensitive_content(
         # We remove the address phrase, not the whole line, so professional
         # text such as "Kendriya Vidyalaya" can remain visible.
         for line in lines:
+            if line["rect"].y0 >= ref_y:
+                continue                    # organisation addresses of referees are not the candidate's
             for m in ADDRESS_HEURISTIC_RE.finditer(line["text"]):
                 phrase = m.group(0).strip()
                 # Require a meaningful location signal; don't redact generic
@@ -1322,6 +1437,11 @@ def verify_output(pdf_bytes: bytes, original_name: str, original_phone: str) -> 
             digits = re.sub(r"\D", "", text)
             if name_compact and len(name_compact) >= 5 and name_compact in compact:
                 issues.append(f"page {pno + 1}: name still readable")
+            else:
+                for tgt, _ in _name_targets(original_name)[2:]:
+                    if len(tgt) >= 9 and tgt in compact:
+                        issues.append(f"page {pno + 1}: name still readable")
+                        break
             if phone and phone in digits:
                 issues.append(f"page {pno + 1}: mobile number still readable")
             if EMAIL_RE.search(text) or re.search(r"[\w.+-]+\s*@\s*[\w-]+\s*\.\s*\w{2,}", text):
