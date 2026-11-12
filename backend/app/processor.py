@@ -403,7 +403,45 @@ def line_items(page: fitz.Page, textpage=None) -> list[dict]:
         )
         result.append({"text": text, "rect": rect, "words": words})
     result.sort(key=lambda x: (x["rect"].y0, x["rect"].x0))
-    return result
+    return _join_label_value_cells(result)
+
+
+def _join_label_value_cells(lines: list[dict]) -> list[dict]:
+    """Table-style CVs ("Full Name:" | "Dr. Neha R. Chavan", "Date of Birth" | ": 06/01/1998")
+    are returned by some PyMuPDF versions as separate lines. Re-join a label cell with
+    the value cell on the same visual row (label ends with ":" or the value starts with ":")
+    so the label/value rules behave the same on every PyMuPDF version."""
+    if len(lines) < 2:
+        return lines
+    rows: list[list[dict]] = []
+    for l in lines:
+        for row in rows:
+            r0 = row[0]["rect"]
+            overlap = min(l["rect"].y1, r0.y1) - max(l["rect"].y0, r0.y0)
+            if overlap >= 0.6 * min(l["rect"].height, r0.height):
+                row.append(l)
+                break
+        else:
+            rows.append([l])
+    out: list[dict] = []
+    for row in rows:
+        row.sort(key=lambda l: l["rect"].x0)
+        merged = [row[0]]
+        for l in row[1:]:
+            prev = merged[-1]
+            gap = l["rect"].x0 - prev["rect"].x1
+            if (prev["text"].rstrip().endswith(":") or l["text"].lstrip().startswith(":")) and 0 <= gap <= 260:
+                words = sorted(prev["words"] + l["words"], key=lambda w: (w[0], w[1]))
+                merged[-1] = {
+                    "text": " ".join(w[4] for w in words).strip(),
+                    "rect": fitz.Rect(prev["rect"]) | l["rect"],
+                    "words": words,
+                }
+            else:
+                merged.append(l)
+        out.extend(merged)
+    out.sort(key=lambda x: (x["rect"].y0, x["rect"].x0))
+    return out
 
 
 def padded_rect(page: fitz.Page, rect: fitz.Rect, px=2, py=1.5) -> fitz.Rect:
@@ -979,6 +1017,24 @@ def is_section_or_new_field(text: str) -> bool:
     return False
 
 
+_ADDRESS_NOT_RE = re.compile(
+    r"(?i)\b(?:hospital|college|university|institute|institution|clinic|school|academy|centre|center|medical|"
+    r"programme|program|residency|department|dept|rotation|training|camp|health|posting|posted|"
+    r"experience|years?|yrs?|sessions?|survey|survey)\b"
+)
+
+
+def plausible_address_phrase(phrase: str) -> bool:
+    """Keyword-triggered address guesses ("District ...", "Near ...", "Village ...") must contain a
+    number or a known place name and must not look like an institution / job description."""
+    if _ADDRESS_NOT_RE.search(phrase):
+        return False
+    if re.search(r"\d", phrase):
+        return True
+    toks = [re.sub(r"[^a-z]", "", w.lower()) for w in phrase.split()]
+    return any(t in PLACE_WORDS for t in toks if t)
+
+
 def looks_like_address_continuation(text: str, prev_text: str = "") -> bool:
     """Is `text` plausibly the next line of a multi-line postal address?
     Qualification, experience and other CV content must never be swallowed."""
@@ -1194,7 +1250,7 @@ def redact_sensitive_content(
                     "district", "distt", "pin", "pincode", "post", "village",
                     "house", "flat", "plot", "near", "tehsil"
                 ))
-                if signals < 1 or len(phrase) < 5:
+                if signals < 1 or len(phrase) < 5 or not plausible_address_phrase(phrase):
                     continue
                 for r in search_rects(page, phrase, textpage):
                     rects.append(("address", padded_rect(page, r, 2, 1.5)))
