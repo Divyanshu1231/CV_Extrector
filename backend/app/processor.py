@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 import fitz
 
-from . import photo
+from . import photo, signature
 
 logger = logging.getLogger("cv-privacy")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -747,26 +747,59 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
                 last = row[-1]
                 overlap = min(last["rect"].y1, e["rect"].y1) - max(last["rect"].y0, e["rect"].y0)
                 gap = e["rect"].x0 - last["rect"].x1
-                if overlap > 0.6 * min(last["rect"].height, e["rect"].height) and -2 <= gap <= 2.0 * max(last["rect"].height, e["rect"].height):
+                big = max(last["rect"].height, e["rect"].height)
+                same_size = min(last["size"], e["size"]) >= 0.6 * max(last["size"], e["size"], 0.1)
+                if overlap > 0.6 * min(last["rect"].height, e["rect"].height) and -2 <= gap <= 1.5 * big and same_size:
                     row.append(e)
                     break
             else:
                 rows.append([e])
+        infos = []
         for row in rows:
             row.sort(key=lambda e: e["rect"].x0)
             rect = fitz.Rect(row[0]["rect"])
             for e in row[1:]:
                 rect |= e["rect"]
-            text = clean_name_text(" ".join(e["text"] for e in row))
-            size = max(e["size"] for e in row)
+            infos.append({"rect": rect, "text": clean_name_text(" ".join(e["text"] for e in row)),
+                          "size": max(e["size"] for e in row), "bold": any(e["bold"] for e in row)})
+        infos.sort(key=lambda i: (i["rect"].y0, i["rect"].x0))
+
+        # A big name that wraps ("DR. DHIRENDRA SINGH" / "SOLANKI") arrives as two stacked rows of the
+        # same size and alignment: join them when the combination reads as a name.
+        merged = []
+        pool = list(infos)
+        while pool:
+            cur = pool.pop(0)
+            while True:
+                found = None
+                for j, nxt in enumerate(pool):
+                    ratio = min(cur["size"], nxt["size"]) / max(cur["size"], nxt["size"], 0.1)
+                    gap = nxt["rect"].y0 - cur["rect"].y1
+                    h = max(cur["rect"].height, nxt["rect"].height)
+                    same_col = (abs(cur["rect"].x0 - nxt["rect"].x0) <= 8 or
+                                abs((cur["rect"].x0 + cur["rect"].x1) / 2 - (nxt["rect"].x0 + nxt["rect"].x1) / 2) <= 10)
+                    if ratio >= 0.85 and -2 <= gap <= 0.7 * h and same_col:
+                        combined = clean_name_text(cur["text"] + " " + nxt["text"])
+                        part_ok = any(looks_like_name(t) or looks_like_single_name(t) for t in (cur["text"], nxt["text"]))
+                        if part_ok and looks_like_name(combined):
+                            found = (j, combined)
+                            break
+                if not found:
+                    break
+                j, combined = found
+                nxt = pool.pop(j)
+                cur = {"rect": fitz.Rect(cur["rect"]) | nxt["rect"], "text": combined,
+                       "size": max(cur["size"], nxt["size"]), "bold": cur["bold"] or nxt["bold"]}
+            merged.append(cur)
+
+        for info in merged:
+            text, rect, size = info["text"], info["rect"], info["size"]
             if looks_like_name(text):
-                cands.append({"text": text, "page": pno, "rect": rect, "size": size,
-                              "bold": any(e["bold"] for e in row)})
+                cands.append({"text": text, "page": pno, "rect": rect, "size": size, "bold": info["bold"]})
             elif looks_like_single_name(text) and rect.y0 <= H * 0.22:
-                others = [max(x["size"] for x in r2) for r2 in rows if r2 is not row]
-                cands.append({"text": text, "page": pno, "rect": rect, "size": size,
-                              "bold": any(e["bold"] for e in row), "single": True,
-                              "median": median_size, "others_max": max(others, default=0)})
+                others = [m["size"] for m in merged if m is not info]
+                cands.append({"text": text, "page": pno, "rect": rect, "size": size, "bold": info["bold"],
+                              "single": True, "median": median_size, "others_max": max(others, default=0)})
     return cands
 
 
@@ -1427,6 +1460,36 @@ def add_watermark_and_code(doc: fitz.Document, cv_code: str, watermark_text: str
         )
 
 
+def redact_signatures(doc: fitz.Document, logs: dict):
+    """Blank handwritten signatures (pasted images, scans, drawn scribbles near a signature
+    anchor) at pixel level, and remove typed "Sd/-" marks. Surrounding text is never touched."""
+    logs["signature_rects"] = []
+    line_art = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_COVERED", fitz.PDF_REDACT_LINE_ART_NONE)
+    text_none = getattr(fitz, "PDF_REDACT_TEXT_NONE", fitz.PDF_REDACT_TEXT_REMOVE)
+    for pno, page in enumerate(doc):
+        tp = get_ocr_textpage(page)
+        lines = line_items(page, tp)
+        words = [fitz.Rect(w[:4]) for w in page_words(page, tp)]
+        ink, typed = signature.detect_signature_rects(page, lines, words)
+        if not ink and not typed:
+            continue
+        raw_words = page.get_text("words")
+        for r in ink:
+            pad = _clip_to_neighbors(fitz.Rect(r.x0 - 3, r.y0 - 3, r.x1 + 3, r.y1 + 3) & page.rect, raw_words) if raw_words else \
+                (fitz.Rect(r.x0 - 3, r.y0 - 3, r.x1 + 3, r.y1 + 3) & page.rect)
+            if pad.is_empty:
+                continue
+            page.add_redact_annot(pad, fill=(1, 1, 1), cross_out=False)
+            logs["signature_rects"].append(f"p{pno + 1}:" + str(tuple(round(v, 1) for v in pad)))
+        if ink:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=line_art, text=text_none)
+        for r in typed:
+            page.add_redact_annot(fitz.Rect(r) & page.rect, fill=(1, 1, 1), cross_out=False)
+            logs["signature_rects"].append(f"p{pno + 1}:typed")
+        if typed:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+
+
 def sanitize_document(doc: fitz.Document):
     """Strip identity hidden outside the visible page: document metadata (author,
     title often contains the candidate name), XMP, bookmarks, attachments,
@@ -1568,6 +1631,7 @@ def process_pdf(
 
         logs = redact_sensitive_content(doc, original_name, name_page, original_phone, name_rect)
         redact_candidate_photos(doc, logs)
+        redact_signatures(doc, logs)
         sanitize_document(doc)
         add_watermark_and_code(doc, cv_code, wm["text"])
         pdf_bytes = _save(doc)
@@ -1596,6 +1660,7 @@ def process_pdf(
             "dob_removed": len(logs["dob_rects"]),
             "links_removed": len(logs["social_rects"]),
             "photos_removed": len(logs["photo_rects"]),
+            "signatures_removed": len(logs.get("signature_rects", [])),
             "photo_detector": logs.get("photo_detector", "none"),
             "watermark": wm["key"],
             "verified": not issues,
