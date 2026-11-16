@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover
     mp = None
     _MP_OK = False
 
-_MP_DETECTORS = None
+_MP_DETECTORS: dict = {}
 
 _CASCADES = None
 _CASCADE_FILES = (
@@ -87,24 +87,23 @@ def _iou(a, b) -> float:
     return inter / union if union else 0.0
 
 
-def _detect_faces_mediapipe(img) -> list[tuple[int, int, int, int]]:
+def _detect_faces_mediapipe(img, conf: float = 0.55, frac=(0.03, 0.32)) -> list[tuple[int, int, int, int]]:
     """MediaPipe BlazeFace: far more reliable than Haar for glasses, beards,
     small/low-contrast photos and photos on busy backgrounds."""
-    global _MP_DETECTORS
-    if _MP_DETECTORS is None:
-        _MP_DETECTORS = [
-            mp.solutions.face_detection.FaceDetection(model_selection=sel, min_detection_confidence=0.55)
+    if conf not in _MP_DETECTORS:
+        _MP_DETECTORS[conf] = [
+            mp.solutions.face_detection.FaceDetection(model_selection=sel, min_detection_confidence=conf)
             for sel in (1, 0)
         ]
     h, w = img.shape[:2]
     found = []
-    for det in _MP_DETECTORS:
+    for det in _MP_DETECTORS[conf]:
         res = det.process(np.ascontiguousarray(img))
         for d in (res.detections or []):
             b = d.location_data.relative_bounding_box
             x, y = max(0, int(b.xmin * w)), max(0, int(b.ymin * h))
             fw, fh = int(b.width * w), int(b.height * h)
-            if fw >= w * 0.03 and fw <= w * 0.32 and fh >= w * 0.03:
+            if frac[0] * w <= fw <= frac[1] * w and fh >= frac[0] * w:
                 found.append((x, y, fw, fh))
     merged = []
     for f in sorted(found, key=lambda r: -r[2] * r[3]):
@@ -113,13 +112,29 @@ def _detect_faces_mediapipe(img) -> list[tuple[int, int, int, int]]:
     return [f for f in merged if 0.6 <= f[2] / max(f[3], 1) <= 1.6]
 
 
-def _detect_faces(img) -> list[tuple[int, int, int, int]]:
+def _detect_faces(img, conf: float = 0.55, frac=(0.03, 0.32)) -> list[tuple[int, int, int, int]]:
     if _MP_OK:
         try:
-            return _detect_faces_mediapipe(img)
+            return _detect_faces_mediapipe(img, conf, frac)
         except Exception as exc:
             logger.warning("MediaPipe face detection failed, using Haar: %s", exc)
     return _detect_faces_haar(img)
+
+
+def _faces_in_rect(page: fitz.Page, rect: fitz.Rect, conf: float = 0.45, width_px: int = 720) -> list[fitz.Rect]:
+    """Detect faces inside one region rendered large. A small face in a big photo is only a few
+    pixels in a full-page render (borderline for the detector); the same face in a zoomed crop is easy."""
+    rect = fitz.Rect(rect) & page.rect
+    if rect.is_empty or rect.width < 20 or rect.height < 20:
+        return []
+    zoom = min(max(width_px / rect.width, 1.0), 4.0)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, colorspace=fitz.csRGB, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    out = []
+    for (fx, fy, fw, fh) in _detect_faces(img, conf=conf, frac=(0.05, 0.6)):
+        out.append(fitz.Rect(rect.x0 + fx / zoom, rect.y0 + fy / zoom,
+                             rect.x0 + (fx + fw) / zoom, rect.y0 + (fy + fh) / zoom))
+    return out
 
 
 def _detect_faces_haar(img) -> list[tuple[int, int, int, int]]:
@@ -197,6 +212,19 @@ def _embedded_image_rects(page: fitz.Page) -> list[fitz.Rect]:
     return rects
 
 
+def _dedupe_rects(rects: list[fitz.Rect], thr: float = 0.5) -> list[fitz.Rect]:
+    out: list[fitz.Rect] = []
+    for r in sorted(rects, key=lambda r: -r.get_area()):
+        if all((r & f).get_area() < thr * r.get_area() for f in out):
+            out.append(r)
+    return out
+
+
+def _scan_like(page: fitz.Page, embedded: list[fitz.Rect]) -> bool:
+    page_area = max(page.rect.get_area(), 1)
+    return sum(r.get_area() for r in embedded) / page_area > 0.6 or not page.get_text("words")
+
+
 def detect_photo_rects(page: fitz.Page) -> list[fitz.Rect]:
     """Return page-coordinate rectangles that contain a candidate photo."""
     page_area = max(page.rect.get_area(), 1)
@@ -206,9 +234,26 @@ def detect_photo_rects(page: fitz.Page) -> list[fitz.Rect]:
     if available():
         try:
             img, zoom = _render(page)
-            for face in _detect_faces(img):
-                fx, fy, fw, fh = face
-                face_rect = fitz.Rect(fx / zoom, fy / zoom, (fx + fw) / zoom, (fy + fh) / zoom)
+            faces: list[fitz.Rect] = []
+            # (1) whole page
+            for (fx, fy, fw, fh) in _detect_faces(img):
+                faces.append(fitz.Rect(fx / zoom, fy / zoom, (fx + fw) / zoom, (fy + fh) / zoom))
+            # (2) every embedded picture on its own, zoomed (catches small faces in event/podium photos)
+            for er in embedded:
+                if 0.004 <= er.get_area() / page_area <= 0.9 and not any(er.intersects(f) for f in faces):
+                    faces.extend(_faces_in_rect(page, er))
+            # (3) scanned / photographed pages: look tile by tile in the top 60% of the page
+            if not faces and _scan_like(page, embedded):
+                W, H = page.rect.width, page.rect.height
+                tw, th = W * 0.6, H * 0.34
+                for ty in (0.0, H * 0.2):
+                    for tx in (0.0, W * 0.4):
+                        faces.extend(_faces_in_rect(page, fitz.Rect(tx, ty, tx + tw, ty + th), conf=0.5))
+            faces = _dedupe_rects(faces)
+
+            for face_rect in faces:
+                fx, fy = face_rect.x0 * zoom, face_rect.y0 * zoom
+                face = (int(fx), int(fy), int(face_rect.width * zoom), int(face_rect.height * zoom))
 
                 # (a) exact embedded photo image that contains the face
                 chosen = None
@@ -230,16 +275,24 @@ def detect_photo_rects(page: fitz.Page) -> list[fitz.Rect]:
 
     if not out:
         # Fallback for environments without OpenCV / faces the detector missed:
-        # portrait-ish embedded image near the top, but never a full-page scan.
+        # a photographic embedded image near the top, but never a full-page scan.
         for r in embedded:
             ratio = r.width / max(r.height, 1)
             area_ratio = r.get_area() / page_area
-            if r.y0 <= page.rect.height * 0.35 and 0.008 <= area_ratio <= 0.30 and 0.55 <= ratio <= 1.45:
+            if r.y0 <= page.rect.height * 0.35 and 0.008 <= area_ratio <= 0.30 and 0.55 <= ratio <= 1.9 \
+                    and _looks_photographic(page, r):
                 out.append(r)
 
-    # de-duplicate overlapping rects
-    final: list[fitz.Rect] = []
-    for r in sorted(out, key=lambda r: -r.get_area()):
-        if all(fitz.Rect(r).intersect(f).get_area() < 0.6 * r.get_area() for f in final):
-            final.append(r)
-    return final
+    return _dedupe_rects(out, 0.6)
+
+
+def _looks_photographic(page: fitz.Page, rect: fitz.Rect) -> bool:
+    """Photos have a busy, mostly non-white picture; logos/rules/signatures are mostly white or flat."""
+    if not available():
+        return True
+    try:
+        pix = page.get_pixmap(clip=rect & page.rect, dpi=40, colorspace=fitz.csGRAY, alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8)
+        return float((arr < 235).mean()) > 0.55 and float(arr.std()) > 28
+    except Exception:
+        return True
