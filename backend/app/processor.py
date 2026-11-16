@@ -1392,7 +1392,21 @@ def redact_sensitive_content(
     return logs
 
 
-def redact_candidate_photos(doc: fitz.Document, logs: dict):
+def plan_candidate_photos(doc: fitz.Document) -> dict:
+    """Find photos on the untouched pages. Detection must happen *before* any redaction:
+    re-encoding an image after other redactions can push a borderline face below the
+    detector's threshold."""
+    plan = {}
+    for pno, page in enumerate(doc):
+        if pno >= 3:  # candidate photos live on the first pages
+            break
+        rects = photo.detect_photo_rects(page)
+        if rects:
+            plan[pno] = rects
+    return plan
+
+
+def redact_candidate_photos(doc: fitz.Document, logs: dict, plan: dict | None = None):
     """Remove the candidate's photo from every kind of CV.
 
     Detection is pixel based (see photo.py): it works for embedded images,
@@ -1403,12 +1417,10 @@ def redact_candidate_photos(doc: fitz.Document, logs: dict):
     logs["photo_detector"] = photo.detector_name()
     line_art = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_COVERED", fitz.PDF_REDACT_LINE_ART_NONE)
     text_none = getattr(fitz, "PDF_REDACT_TEXT_NONE", fitz.PDF_REDACT_TEXT_REMOVE)
-    for pno, page in enumerate(doc):
-        if pno >= 3:  # candidate photos live on the first pages
-            break
-        rects = photo.detect_photo_rects(page)
-        if not rects:
-            continue
+    if plan is None:
+        plan = plan_candidate_photos(doc)
+    for pno, rects in plan.items():
+        page = doc[pno]
         for r in rects:
             pad = fitz.Rect(r.x0 - 3, r.y0 - 3, r.x1 + 3, r.y1 + 3) & page.rect
             if pad.is_empty:
@@ -1629,8 +1641,9 @@ def process_pdf(
         cv_code = generate_cv_code(original_name, original_phone)
         logger.info("Name detected: %s | Mobile detected | CV Code: %s | pages=%s", bool(original_name), cv_code, doc.page_count)
 
+        photo_plan = plan_candidate_photos(doc)
         logs = redact_sensitive_content(doc, original_name, name_page, original_phone, name_rect)
-        redact_candidate_photos(doc, logs)
+        redact_candidate_photos(doc, logs, photo_plan)
         redact_signatures(doc, logs)
         sanitize_document(doc)
         add_watermark_and_code(doc, cv_code, wm["text"])
