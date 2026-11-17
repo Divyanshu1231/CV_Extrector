@@ -208,7 +208,30 @@ class ProcessResult:
     report: dict = field(default_factory=dict)
 
 
+def _is_id_token(tok: str) -> bool:
+    """DOIs, PubMed/ISSN/ORCID ids and similar identifiers are digit-heavy but are not phone numbers:
+    "10.1007/s43465-026-01915-x", "s43465-026-01915-x", "PMID:12345678", "ISSN-1234-5678"."""
+    t = tok.strip(",;()[]<>\"'")
+    if re.match(r"(?i)^(?:doi:?)?10\.\d{4,}/", t):
+        return True
+    core = re.sub(r"^[A-Za-z]+[:.\-]?(?=[\d+(])", "", t)            # "Mobile:8920680401" -> "8920680401"
+    letters = re.findall(r"[A-Za-z]", core)
+    if letters and len(re.findall(r"\d", core)) >= 6 and not re.fullmatch(r"(?i)\d[\d\s().+-]*(?:x\d+)?", core):
+        return True
+    return "/" in t and bool(letters)
+
+
+def _match_in_id_token(text: str, m: re.Match) -> bool:
+    a, b = m.span()
+    while a > 0 and not text[a - 1].isspace():
+        a -= 1
+    while b < len(text) and not text[b].isspace():
+        b += 1
+    return _is_id_token(text[a:b])
+
+
 def normalize_phone(value: str) -> str:
+    value = " ".join(t for t in value.split() if not _is_id_token(t))
     digits = re.sub(r"\D", "", value)
     if digits.startswith("00"):
         digits = digits[2:]
@@ -323,6 +346,16 @@ def get_ocr_textpage(page: fitz.Page):
             raise DetectionError("OCR_FAILED", f"OCR could not read this scanned CV: {exc}")
     store[page.number] = tp
     return tp
+
+
+def _is_credential_line(text: str) -> bool:
+    """"( MS Ortho, DNB Ortho, MNAMS" / "MBBS )" / "MD, DM": qualifications under a name are
+    not part of the name and must never be merged into it."""
+    t = text.strip()
+    if t.startswith("("):
+        return True
+    toks = [re.sub(r"[^a-z]", "", w.lower()) for w in t.split()]
+    return any(tok in DEGREE_TOKENS for tok in toks if tok)
 
 
 def _is_letterspaced(words: list) -> bool:
@@ -792,7 +825,7 @@ def _name_candidates(doc: fitz.Document, max_pages=2):
                     h = max(cur["rect"].height, nxt["rect"].height)
                     same_col = (abs(cur["rect"].x0 - nxt["rect"].x0) <= 8 or
                                 abs((cur["rect"].x0 + cur["rect"].x1) / 2 - (nxt["rect"].x0 + nxt["rect"].x1) / 2) <= 10)
-                    if ratio >= 0.85 and -2 <= gap <= 0.7 * h and same_col:
+                    if ratio >= 0.85 and -2 <= gap <= 0.7 * h and same_col and not _is_credential_line(nxt["text"]):
                         combined = clean_name_text(cur["text"] + " " + nxt["text"])
                         part_ok = any(looks_like_name(t) or looks_like_single_name(t) for t in (cur["text"], nxt["text"]))
                         if part_ok and looks_like_name(combined):
@@ -1000,9 +1033,11 @@ def detect_phone(doc: fitz.Document) -> tuple[str, int | None, fitz.Rect | None]
     for pno, page in enumerate(doc):
         textpage = get_ocr_textpage(page)
         for line in line_items(page, textpage):
-            m = PHONE_RE.search(line["text"])
-            if m and normalize_phone(m.group(0)):
-                return m.group(0), pno, line["rect"]
+            for m in PHONE_RE.finditer(line["text"]):
+                if _match_in_id_token(line["text"], m):
+                    continue
+                if normalize_phone(m.group(0)):
+                    return m.group(0), pno, line["rect"]
     # OCR sometimes splits one number across several fragments ("76772 21268").
     for pno, page in enumerate(doc):
         textpage = get_ocr_textpage(page)
