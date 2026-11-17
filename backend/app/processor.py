@@ -115,6 +115,20 @@ REG_EXTRA_RES = [
     re.compile(r"(?i)\b(?:Voter\s*ID|EPIC)\s*(?:No\.?|Number|Card)?\s*[:\-–—#]?\s*[A-Z]{3}\d{7}"),
     re.compile(r"(?i)\b(?:UAN|PF\s*(?:No|Number)|ESIC?\s*(?:No|Number))\.?\s*[:\-–—#]?\s*\d{8,14}"),
 ]
+# --- Family details (father / mother / spouse ...) -------------------------------------------
+FAMILY_LABEL_RE = re.compile(
+    r"(?i)^\s*(?:father|mother|parents?|guardian|spouse|husband|wife|fathers?\s*/\s*husband(?:s)?)"
+    r"(?:['’]s)?\s*(?:full\s+)?(?:name|occupation|profession|details?|designation|contact(?:\s+(?:no\.?|number))?)?"
+    r"\s*(?:/\s*guardian)?\s*[:\-–—]\s*"
+)
+MARITAL_LABEL_RE = re.compile(r"(?i)^\s*marital\s+status\s*[:\-–—]\s*")
+SPOUSE_WORD_RE = re.compile(r"(?i)^(?:spouse|husband|wife)(?:['’]s)?[,.;:]?$")
+RELATION_INLINE_RE = re.compile(
+    r"(?i)\b(?:s/o|d/o|w/o|h/o|c/o)\.?\s+(?:(?:dr|mr|mrs|ms|late|shri|smt|sri)\.?\s+)*"
+    r"(?-i:[A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){0,3})"       # Capitalised words only
+)
+_ANY_LABEL_RE = re.compile(r"^\s*[A-Za-z][A-Za-z ./'’()&-]{1,34}\s*:\s*\S?")
+
 # label at the end of a line, value on the next line
 REG_LABEL_ONLY_RE = re.compile(r"(?i)\b(?:Regd?|Regn|Registration|Reg)\.?\s*(?:No\.?|Number|Num|#)\s*[:\-–—.]?\s*$")
 REG_VALUE_ONLY_RE = re.compile(r"^\s*" + _ID + r"\s*$", re.I)
@@ -1034,7 +1048,7 @@ def is_section_or_new_field(text: str) -> bool:
         return True
     field_patterns = [
         NAME_LABEL_RE, PHONE_LABEL_RE, EMAIL_LABEL_RE,
-        ADDRESS_LABEL_RE, REG_LABEL_RE, DOB_LABEL_RE,
+        ADDRESS_LABEL_RE, REG_LABEL_RE, DOB_LABEL_RE, FAMILY_LABEL_RE, MARITAL_LABEL_RE,
     ]
     if any(p.match(t) for p in field_patterns):
         return True
@@ -1066,6 +1080,75 @@ def plausible_address_phrase(phrase: str) -> bool:
         return True
     toks = [re.sub(r"[^a-z]", "", w.lower()) for w in phrase.split()]
     return any(t in PLACE_WORDS for t in toks if t)
+
+
+def _paren_balance(t: str) -> int:
+    return t.count("(") - t.count(")")
+
+
+def family_rects(page: fitz.Page, lines: list[dict]) -> list[fitz.Rect]:
+    """Remove parents' / spouse details.
+
+    "Father's Name: Dr X (MBBS, MD ... Ex HOD ... )" wraps over several lines, so a family label
+    starts a *block* that continues while parentheses are open, the previous line ends in a
+    continuation word/comma, or the next line starts in lower case - and stops at the next
+    "Label:" / heading. "Marital status: Married, Spouse working as ..." keeps the status and
+    loses the spouse clause."""
+    out: list[fitz.Rect] = []
+    used: set[int] = set()
+    for idx, line in enumerate(lines):
+        if idx in used:
+            continue
+        text = line["text"]
+        is_family = bool(FAMILY_LABEL_RE.match(text))
+        is_marital = bool(MARITAL_LABEL_RE.match(text))
+        if not (is_family or is_marital):
+            continue
+        block = [line]
+        bal = _paren_balance(text)
+        for j in range(idx + 1, min(len(lines), idx + 6)):
+            nxt = lines[j]
+            prev = block[-1]
+            gap = nxt["rect"].y0 - prev["rect"].y1
+            if gap > 22 or nxt["rect"].y0 < prev["rect"].y0 - 2:
+                break
+            nt = nxt["text"]
+            if is_section_or_new_field(nt) or FAMILY_LABEL_RE.match(nt) or MARITAL_LABEL_RE.match(nt) \
+                    or _ANY_LABEL_RE.match(nt):
+                break
+            pt = prev["text"].rstrip()
+            cont = (bal != 0 or re.search(r"[,&(/\-–—]$", pt) is not None
+                    or re.search(r"(?i)\b(?:of|and|in|at|the|dept|deptt|department|hospital|with|as|a|an)$", pt) is not None
+                    or nt[:1].islower())
+            if not cont:
+                break
+            block.append(nxt)
+            used.add(j)
+            bal += _paren_balance(nt)
+        used.add(idx)
+        if is_family:
+            for ln in block:
+                out.append(padded_rect(page, ln["rect"], 3, 0.5))
+        else:
+            # keep "Marital status: Married," and remove everything from the spouse clause onward
+            started = False
+            for ln in block:
+                ws = [w for w in ln["words"]]
+                hit = None
+                for k, w in enumerate(ws):
+                    if SPOUSE_WORD_RE.match(w[4]):
+                        hit = k
+                        break
+                if started or hit is not None:
+                    sel = ws if started else ws[hit:]
+                    started = True
+                    if sel:
+                        out.append(padded_rect(page, fitz.Rect(min(w[0] for w in sel), min(w[1] for w in sel),
+                                                              max(w[2] for w in sel), max(w[3] for w in sel)), 2, 0.5))
+    # "Dr. X S/o Y", "D/o Dr. Y" written inline anywhere
+    for r in rects_for_regex_lines(page, RELATION_INLINE_RE, None):
+        out.append(r)
+    return out
 
 
 def looks_like_address_continuation(text: str, prev_text: str = "") -> bool:
@@ -1177,7 +1260,7 @@ def redact_sensitive_content(
     logs = {
         "name_rects": [], "address_rects": [], "phone_rects": [],
         "email_rects": [], "registration_rects": [], "dob_rects": [],
-        "social_rects": [], "photo_rects": [],
+        "social_rects": [], "photo_rects": [], "family_rects": [],
         "pages": doc.page_count,
         "ocr_pages": [],
     }
@@ -1312,6 +1395,10 @@ def redact_sensitive_content(
             if EMAIL_LABEL_RE.match(line["text"]):
                 rects.append(("email", padded_rect(page, line["rect"], 3, 2)))
 
+        # 4a) Parents / spouse details (the personal-profile block).
+        for r in family_rects(page, lines):
+            rects.append(("family", r))
+
         # 4b) Social / messaging profile links (linkedin, github, wa.me ...).
         for r in rects_for_regex_lines(page, SOCIAL_RE, textpage):
             rects.append(("social", r))
@@ -1379,6 +1466,7 @@ def redact_sensitive_content(
         redact_rects(page, by_label.get("phone", []), logs["phone_rects"], "phone")
         redact_rects(page, by_label.get("email", []), logs["email_rects"], "email")
         redact_rects(page, by_label.get("social", []), logs["social_rects"], "social")
+        redact_rects(page, by_label.get("family", []), logs["family_rects"], "family")
         redact_rects(page, by_label.get("registration", []), logs["registration_rects"], "registration")
         redact_rects(page, by_label.get("dob", []), logs["dob_rects"], "dob")
 
@@ -1674,6 +1762,7 @@ def process_pdf(
             "links_removed": len(logs["social_rects"]),
             "photos_removed": len(logs["photo_rects"]),
             "signatures_removed": len(logs.get("signature_rects", [])),
+            "family_removed": len(logs.get("family_rects", [])),
             "photo_detector": logs.get("photo_detector", "none"),
             "watermark": wm["key"],
             "verified": not issues,
